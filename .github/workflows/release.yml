@@ -1,0 +1,170 @@
+# Publishes the image for a release tag vX.Y.Z as exactly one image tag,
+# ghcr.io/<owner>/<repo>:X.Y.Z (the release tag without its `v`). There is no
+# `latest` tag, and a published tag is never moved. Procedure: docs/RELEASE.md.
+#
+#   prepare      maps the tag to the version, refuses an existing image tag
+#   build-amd64  natively, per platform: one build that is both loaded locally
+#   build-arm64  and pushed by digest only (no tag), then `make test` checks
+#                the loaded image, which is byte for byte the pushed one
+#   publish      tags the two tested digests once as X.Y.Z, asserts the tags
+#                and platforms, and writes the digest into the release notes
+#
+# The only credential is the built-in GITHUB_TOKEN (`packages: write`).
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      version: ${{ steps.map.outputs.version }}
+      image: ${{ steps.map.outputs.image }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Map the release tag to the image tag
+        id: map
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          test "$REF_TYPE" = tag || { echo "not a tag: $REF_TYPE" >&2; exit 1; }
+          version=$(python3 scripts/release.py version "$TAG")
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          echo "release $TAG -> $image:$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+      # Early, fail-fast check. Before the first release the package does not
+      # exist and cannot be read, so this check may pass without proof;
+      # `publish` repeats it strictly right before tagging.
+      - name: Refuse an existing image tag (early)
+        env:
+          REGISTRY_USER: ${{ github.actor }}
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE: ${{ steps.map.outputs.image }}
+          VERSION: ${{ steps.map.outputs.version }}
+        run: python3 scripts/release.py assert-absent "$IMAGE" "$VERSION" --allow-unreadable
+
+  build-amd64:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    env:
+      RELEASE_REPO: ${{ needs.prepare.outputs.image }}
+      RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+      RELEASE_PLATFORM: linux/amd64
+      IMAGE: tlaplus-toolchain:release
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Log in to ghcr.io with GITHUB_TOKEN
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+      - name: Build, load and push by digest
+        id: build
+        run: |
+          make release-build RELEASE_REVISION="$GITHUB_SHA" DIGEST_FILE="$RUNNER_TEMP/digest"
+          echo "digest=$(cat "$RUNNER_TEMP/digest")" >> "$GITHUB_OUTPUT"
+      - name: Test the loaded image
+        run: make test
+      - name: Log out
+        if: always()
+        run: docker logout ghcr.io
+
+  build-arm64:
+    needs: prepare
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    env:
+      RELEASE_REPO: ${{ needs.prepare.outputs.image }}
+      RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+      RELEASE_PLATFORM: linux/arm64
+      IMAGE: tlaplus-toolchain:release
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Log in to ghcr.io with GITHUB_TOKEN
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+      - name: Build, load and push by digest
+        id: build
+        run: |
+          make release-build RELEASE_REVISION="$GITHUB_SHA" DIGEST_FILE="$RUNNER_TEMP/digest"
+          echo "digest=$(cat "$RUNNER_TEMP/digest")" >> "$GITHUB_OUTPUT"
+      - name: Test the loaded image
+        run: make test
+      - name: Log out
+        if: always()
+        run: docker logout ghcr.io
+
+  publish:
+    needs: [prepare, build-amd64, build-arm64]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write   # create the GitHub release and its notes
+      packages: write   # push the one image tag
+    env:
+      IMAGE: ${{ needs.prepare.outputs.image }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+      TAG: ${{ github.ref_name }}
+      AMD64: ${{ needs.build-amd64.outputs.digest }}
+      ARM64: ${{ needs.build-arm64.outputs.digest }}
+      REGISTRY_USER: ${{ github.actor }}
+      REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Log in to ghcr.io with GITHUB_TOKEN
+        run: printf '%s' "$REGISTRY_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+      - name: Tag the tested digests once, as X.Y.Z
+        run: |
+          # Strict: the registry must prove that X.Y.Z does not exist (the
+          # package exists now; the build jobs pushed its digests).
+          python3 scripts/release.py assert-absent "$IMAGE" "$VERSION"
+          docker buildx imagetools create -t "$IMAGE:$VERSION" "$IMAGE@$AMD64" "$IMAGE@$ARM64"
+      - name: Assert the tags and the platforms
+        run: |
+          python3 scripts/release.py assert-tags "$IMAGE" "$VERSION"
+          digest=$(python3 scripts/release.py assert-platforms "$IMAGE" "$VERSION" linux/amd64 linux/arm64)
+          echo "DIGEST=$digest" >> "$GITHUB_ENV"
+      - name: Write the release notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 scripts/release.py notes "$IMAGE" "$VERSION" "$DIGEST" linux/amd64 linux/arm64 > "$RUNNER_TEMP/notes.md"
+          cat "$RUNNER_TEMP/notes.md" >> "$GITHUB_STEP_SUMMARY"
+          gh release create "$TAG" --verify-tag --title "$TAG" --notes-file "$RUNNER_TEMP/notes.md"
+      - name: Log out
+        if: always()
+        run: docker logout ghcr.io

@@ -1,0 +1,42 @@
+# Example only: a GitHub Actions workflow that model-checks the specs in
+# specs/ with the hardened invocation. Copy it to .github/workflows/tla.yml
+# and adapt it; it is an illustration, not a maintained template.
+# Guide: docs/INTEGRATION.md in the tlaplus-toolchain repository.
+name: tla
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  tlc-check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      # Pin by digest: append @sha256:<digest> from the release notes.
+      TLAPLUS_IMAGE: ghcr.io/xiam/tlaplus-toolchain:0.1.0
+      SPEC_DIR: specs
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Model-check the specs
+        run: |
+          mkdir -p "$RUNNER_TEMP/tlc-out"
+          docker run --rm \
+            --network none --read-only --tmpfs /tmp:size=256m,mode=1777 \
+            --cap-drop ALL --security-opt no-new-privileges \
+            --user "$(id -u):$(id -g)" \
+            --memory 2g --memory-swap 2g --cpus 2 --pids-limit 512 \
+            -v "$PWD/$SPEC_DIR:/specs:ro" \
+            -v "$RUNNER_TEMP/tlc-out:/out" \
+            "$TLAPLUS_IMAGE" tlc-check --out /out /specs
+      - name: Keep the TLC logs and traces
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tlc-logs
+          path: ${{ runner.temp }}/tlc-out/*.log

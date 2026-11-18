@@ -1,0 +1,52 @@
+# Builds the image natively on linux/amd64 and linux/arm64 and runs every
+# check against it: lint, the checksum negative test, the hardened smoke run,
+# the tlc-check acceptance tests and the consumer-guide example check.
+# Nothing is pushed. Release procedure: docs/RELEASE.md.
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    env:
+      IMAGE: tlaplus-toolchain:ci
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Tool versions
+        run: |
+          docker version --format 'client {{.Client.Version}} / server {{.Server.Version}}'
+          docker buildx version
+          python3 --version
+      - name: Lint
+        run: make lint
+      - name: Check the consumer-guide examples
+        run: |
+          python3 -c 'import yaml' 2>/dev/null || sudo apt-get install -y --no-install-recommends python3-yaml
+          python3 test/examples/check.py
+      - name: Build
+        run: make build IMAGE="$IMAGE"
+      - name: Test
+        run: make test IMAGE="$IMAGE"
