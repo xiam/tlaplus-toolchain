@@ -1,0 +1,816 @@
+#!/usr/bin/env -S python3 -I
+"""tlc-check: model-check every TLA+ model in one directory with TLC.
+
+The contract is docs/SPECS.md. In short:
+
+    tlc-check [OPTIONS] [DIR]
+
+checks every <Name>.cfg in DIR (default: specs) against <Name>.tla, with an
+explicit JVM memory budget, a per-model deadline and a scratch directory
+outside DIR, and returns one exit status for the whole directory.
+
+Python 3 standard library only.
+"""
+
+from __future__ import annotations
+
+import argparse
+import errno
+import hashlib
+import math
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import zipfile
+from dataclasses import dataclass
+from pathlib import Path
+
+VERSION = "0.1.0"
+
+# Exit statuses (docs/SPECS.md, "Exit status").
+EXIT_PASS = 0
+EXIT_FAIL = 1
+EXIT_USAGE = 2
+EXIT_OOM = 3
+EXIT_SCRATCH_FULL = 4
+EXIT_DEADLINE = 124
+# When models end with different non-zero statuses, the first of these wins.
+EXIT_PRECEDENCE = (EXIT_DEADLINE, EXIT_SCRATCH_FULL, EXIT_OOM, EXIT_FAIL)
+
+MIB = 1024 * 1024
+GIB = 1024 * MIB
+
+# Memory policy (docs/SPECS.md, "Memory policy"). The values are measured;
+# the measurements are recorded in docs/SPECS.md.
+HEADROOM = 128 * MIB          # fixed reserve for JVM native memory and tlc-check
+NO_LIMIT_BUDGET = 2 * GIB     # B when the container has no memory limit
+MIN_BUDGET = 128 * MIB        # smallest B that runs TLC usefully
+HEAP_PERCENT = 70             # share of B for the Java heap
+OFFHEAP_PERCENT = 25          # share of B for TLC's off-heap fingerprint set
+# The remaining 5 % of B is kept for garbage-collector structures that grow
+# with the heap (about 4 % of the heap for the parallel collector).
+
+DEFAULT_DEADLINE = 30 * 60    # seconds, per model
+TERM_GRACE = 10               # seconds between SIGTERM and SIGKILL
+ENOSPC_GRACE = 30             # seconds a JVM may run on after reporting a full disk
+
+DEFAULT_JAR = "/opt/tlaplus/tla2tools.jar"
+JAR_ENV = "TLA2TOOLS_JAR"
+# Environment variables that the JVM reads as extra options. They could
+# override the budget, so the JVM never sees them.
+JAVA_ENV_OPTIONS = ("JAVA_TOOL_OPTIONS", "_JAVA_OPTIONS", "JDK_JAVA_OPTIONS")
+
+PROG = "tlc-check"
+
+# A marker candidate is a TLA+ line comment whose first word is
+# expected-states; it must then have the form "\* expected-states: N", N > 0.
+MARKER_START_RE = re.compile(r"^\s*\\\*\s*expected-states\b")
+MARKER_RE = re.compile(r"^\s*\\\*\s*expected-states:\s*([0-9]+)\s*$")
+STATES_RE = re.compile(r"([0-9][0-9,]*) distinct states? found")
+PASS_LINE = "Model checking completed. No error has been found."
+OOM_MARKERS = ("java.lang.OutOfMemoryError",)
+ENOSPC_MARKERS = ("No space left on device", "Disk quota exceeded")
+
+
+def say(msg: str) -> None:
+    print(f"{PROG}: {msg}", flush=True)
+
+
+def warn(msg: str) -> None:
+    print(f"{PROG}: warning: {msg}", file=sys.stderr, flush=True)
+
+
+class UsageError(Exception):
+    """A usage error: exit status 2, before any model starts."""
+
+
+# --------------------------------------------------------------------------
+# Option values
+
+
+SIZE_RE = re.compile(r"^([1-9][0-9]*)([kmg])$")
+DURATION_RE = re.compile(r"^([1-9][0-9]*)([smh])$")
+
+
+def parse_size(text: str) -> int:
+    m = SIZE_RE.match(text)
+    if not m:
+        raise argparse.ArgumentTypeError(
+            f"invalid SIZE '{text}': use a positive integer with k, m or g, for example 1536m")
+    return int(m.group(1)) * {"k": 1024, "m": MIB, "g": GIB}[m.group(2)]
+
+
+def parse_duration(text: str) -> int:
+    m = DURATION_RE.match(text)
+    if not m:
+        raise argparse.ArgumentTypeError(
+            f"invalid DURATION '{text}': use a positive integer with s, m or h, for example 90m")
+    return int(m.group(1)) * {"s": 1, "m": 60, "h": 3600}[m.group(2)]
+
+
+def parse_workers(text: str) -> int:
+    if not re.match(r"^[1-9][0-9]*$", text):
+        raise argparse.ArgumentTypeError(f"invalid N '{text}': use a positive integer")
+    return int(text)
+
+
+def fmt_size(n: int) -> str:
+    if n == 0:
+        return "0"
+    if n % GIB == 0:
+        return f"{n // GIB} GiB"
+    if n >= MIB:
+        return f"{n / MIB:.0f} MiB"
+    return f"{n // 1024} KiB"
+
+
+def fmt_duration(s: int) -> str:
+    if s % 3600 == 0:
+        return f"{s // 3600}h"
+    if s % 60 == 0:
+        return f"{s // 60}m"
+    return f"{s}s"
+
+
+# --------------------------------------------------------------------------
+# Container resources (cgroup v2 and v1)
+
+
+def _cgroup_dirs(controller: str) -> list[Path]:
+    """Directories of this process's cgroup for a controller, leaf first."""
+    try:
+        lines = Path("/proc/self/cgroup").read_text().splitlines()
+    except OSError:
+        return []
+    out: list[Path] = []
+    for line in lines:
+        parts = line.split(":", 2)
+        if len(parts) != 3:
+            continue
+        _, ctrls, rel = parts
+        if ctrls == "":
+            base = Path("/sys/fs/cgroup")                   # cgroup v2
+        elif controller in ctrls.split(","):
+            base = Path("/sys/fs/cgroup") / controller      # cgroup v1
+            if not base.is_dir():
+                base = Path("/sys/fs/cgroup") / ctrls
+        else:
+            continue
+        rel = rel.strip().lstrip("/")
+        leaf = base / rel if rel else base
+        dirs = []
+        if leaf.is_dir():
+            d = leaf
+            while True:
+                dirs.append(d)
+                if d == base:
+                    break
+                d = d.parent
+        elif base.is_dir():
+            # A private cgroup namespace mounts the container's own cgroup
+            # at the root, so the path from /proc/self/cgroup is not visible.
+            dirs.append(base)
+        out.extend(dirs)
+    return out
+
+
+def _read_int(path: Path) -> int | None:
+    try:
+        text = path.read_text().strip()
+    except OSError:
+        return None
+    if text == "max":
+        return None
+    try:
+        return int(text)
+    except ValueError:
+        return None
+
+
+def memory_limit() -> int | None:
+    """The smallest memory limit on this process's cgroup path, or None."""
+    limits = []
+    for d in _cgroup_dirs("memory"):
+        for name in ("memory.max", "memory.limit_in_bytes"):
+            v = _read_int(d / name)
+            # cgroup v1 reports "no limit" as a huge page-aligned number.
+            if v is not None and v < (1 << 62):
+                limits.append(v)
+    return min(limits) if limits else None
+
+
+def oom_kill_count() -> int:
+    """Kernel OOM kills recorded for this process's cgroup (0 if unknown)."""
+    for d in _cgroup_dirs("memory"):
+        for name in ("memory.events", "memory.oom_control"):
+            try:
+                text = (d / name).read_text()
+            except OSError:
+                continue
+            for line in text.splitlines():
+                k, _, v = line.partition(" ")
+                if k == "oom_kill":
+                    try:
+                        return int(v)
+                    except ValueError:
+                        return 0
+    return 0
+
+
+def available_cpus() -> int:
+    """CPUs this process may use: affinity, reduced by any CPU quota."""
+    try:
+        n = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        n = os.cpu_count() or 1
+    for d in _cgroup_dirs("cpu"):
+        quota = period = None
+        try:
+            fields = (d / "cpu.max").read_text().split()
+            if fields and fields[0] != "max":
+                quota, period = int(fields[0]), int(fields[1])
+        except (OSError, ValueError, IndexError):
+            q, p = _read_int(d / "cpu.cfs_quota_us"), _read_int(d / "cpu.cfs_period_us")
+            if q is not None and q > 0 and p:
+                quota, period = q, p
+        if quota and period:
+            n = min(n, max(1, math.ceil(quota / period)))
+    return max(1, n)
+
+
+@dataclass
+class Mount:
+    point: str
+    fstype: str
+    options: set[str]
+
+
+def mount_of(path: Path) -> Mount | None:
+    """The mount that holds path, from /proc/self/mountinfo."""
+    try:
+        lines = Path("/proc/self/mountinfo").read_text().splitlines()
+    except OSError:
+        return None
+    target = str(path)
+    best: Mount | None = None
+    for line in lines:
+        left, sep, right = line.partition(" - ")
+        if not sep:
+            continue
+        lf, rf = left.split(), right.split()
+        if len(lf) < 6 or len(rf) < 3:
+            continue
+        point = lf[4].replace("\\040", " ")
+        if not (target == point or point == "/" or target.startswith(point.rstrip("/") + "/")):
+            continue
+        if best is None or len(point) >= len(best.point):
+            opts = set(lf[5].split(",")) | set(rf[2].split(","))
+            best = Mount(point, rf[0], opts)
+    return best
+
+
+# --------------------------------------------------------------------------
+# Models
+
+
+@dataclass
+class Model:
+    cfg: Path            # absolute path of <Name>.cfg or <Name>.deep.cfg
+    tla: Path            # absolute path of <Name>.tla
+    label: str           # cfg file name, as printed
+    stem: str            # file name without .cfg: names the scratch files
+
+    status: int = EXIT_PASS
+    detail: str = ""
+
+
+def discover(spec_dir: Path, deep: bool) -> list[Model]:
+    if not spec_dir.is_dir():
+        raise UsageError(f"spec directory '{spec_dir}' does not exist or is not a directory")
+    try:
+        names = sorted(e.name for e in os.scandir(spec_dir) if e.is_file())
+    except OSError as e:
+        raise UsageError(f"cannot read spec directory '{spec_dir}': {e.strerror}")
+    models, missing = [], []
+    for name in names:
+        if not name.endswith(".cfg"):
+            continue
+        is_deep = name.endswith(".deep.cfg")
+        if is_deep != deep:
+            continue
+        base = name[: -len(".deep.cfg")] if is_deep else name[: -len(".cfg")]
+        if not base:
+            continue
+        tla = spec_dir / f"{base}.tla"
+        if not tla.is_file():
+            missing.append(f"{name} (no {base}.tla)")
+            continue
+        models.append(Model(cfg=spec_dir / name, tla=tla, label=name, stem=name[: -len(".cfg")]))
+    if missing:
+        raise UsageError("model without its spec: " + ", ".join(missing))
+    if not models:
+        kind = "*.deep.cfg" if deep else "*.cfg (other than *.deep.cfg)"
+        raise UsageError(f"no models in '{spec_dir}': it holds no {kind} file")
+    return models
+
+
+def check_overlap(models: list[Model], spec_dir: Path, out: Path) -> None:
+    """Reject a scratch layout whose generated paths are, or contain, DIR.
+
+    tlc-check removes <out>/<Name>.states and truncates <out>/<Name>.log, so
+    neither may be the spec directory or one of its ancestors.
+    """
+    for model in models:
+        generated = [out / f"{model.stem}.states", out / f"{model.stem}.log"]
+        for path in generated:
+            if path == spec_dir or path in spec_dir.parents:
+                raise UsageError(
+                    f"--out {out} would place the scratch path {path} on the spec "
+                    f"directory {spec_dir}; choose an --out that does not contain it")
+        if out in spec_dir.parents:
+            first = spec_dir.relative_to(out).parts[0]
+            if first.startswith(f"{model.stem}.hs_err_pid"):
+                raise UsageError(
+                    f"--out {out} would place JVM crash logs on the spec directory "
+                    f"{spec_dir}; choose an --out that does not contain it")
+
+
+def read_marker(cfg: Path) -> tuple[int | None, str | None]:
+    """(expected states, error). Both None when the model has no marker."""
+    try:
+        text = cfg.read_text(encoding="utf-8", errors="replace")
+    except OSError as e:
+        return None, f"cannot read {cfg.name}: {e.strerror}"
+    values = set()
+    for line in text.splitlines():
+        if not MARKER_START_RE.match(line):
+            continue
+        m = MARKER_RE.match(line)
+        if not m or int(m.group(1)) == 0:
+            return None, (f"unreadable expected-states marker '{line.strip()}'; "
+                          "use a line of the form '\\* expected-states: <N>' with N > 0")
+        values.add(int(m.group(1)))
+    if len(values) > 1:
+        return None, "several expected-states markers with different values"
+    return (values.pop() if values else None), None
+
+
+# --------------------------------------------------------------------------
+# Running one model
+
+
+class Runner:
+    """Runs TLC for one model at a time; owns at most one JVM."""
+
+    def __init__(self, jar: Path, java: str, heap: int, offheap: int,
+                 workers: int, deadline: int, out: Path, scratch_tmpfs: bool):
+        self.jar = jar
+        self.java = java
+        self.heap = heap
+        self.offheap = offheap
+        self.workers = workers
+        self.deadline = deadline
+        self.out = out
+        self.scratch_tmpfs = scratch_tmpfs
+        self.proc: subprocess.Popen | None = None
+        self.interrupted: int | None = None
+
+    def command(self, model: Model, states: Path) -> list[str]:
+        return [
+            self.java,
+            f"-Xmx{self.heap // 1024}k",
+            f"-XX:MaxDirectMemorySize={self.offheap // 1024}k",
+            "-XX:+UseParallelGC",
+            "-XX:+ExitOnOutOfMemoryError",
+            "-XX:-UsePerfData",
+            "-XX:+DisableAttachMechanism",
+            # Outside the states directory, which is removed after the model.
+            f"-XX:ErrorFile={self.out}/{model.stem}.hs_err_pid%p.log",
+            f"-Djava.io.tmpdir={states}",
+            "-Dtlc2.tool.fp.FPSet.impl=tlc2.tool.fp.OffHeapDiskFPSet",
+            "-cp", str(self.jar),
+            "tlc2.TLC",
+            "-workers", str(self.workers),
+            "-metadir", str(states),
+            "-config", str(model.cfg),
+            str(model.tla),
+        ]
+
+    def stop(self) -> None:
+        """TERM, grace, KILL and reap the JVM this runner started."""
+        proc = self.proc
+        if proc is None or proc.poll() is not None:
+            return
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            proc.wait(timeout=TERM_GRACE)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        proc.wait()
+
+    def run(self, model: Model) -> None:
+        expected, marker_error = read_marker(model.cfg)
+        if marker_error:
+            model.status, model.detail = EXIT_FAIL, marker_error
+            say(f"FAIL {model.label}: {marker_error}")
+            return
+
+        log = self.out / f"{model.stem}.log"
+        states = self.out / f"{model.stem}.states"
+        try:
+            shutil.rmtree(states, ignore_errors=True)
+            states.mkdir(parents=True)
+            # O_NOFOLLOW: a symbolic link planted at the log path is refused,
+            # never followed to a file it points at.
+            fd = os.open(log, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644)
+            logf = os.fdopen(fd, "wb")
+        except OSError as e:
+            if e.errno in (errno.ENOSPC, errno.EDQUOT):
+                model.status = EXIT_SCRATCH_FULL
+                model.detail = f"scratch directory {self.out} is full"
+            else:
+                model.status = EXIT_FAIL
+                model.detail = f"cannot prepare scratch files in {self.out}: {e.strerror}"
+            say(f"FAIL {model.label}: {model.detail}")
+            return
+
+        env = {k: v for k, v in os.environ.items() if k not in JAVA_ENV_OPTIONS}
+        print(f"=== {PROG}: {model.label} ({model.tla.name}) ===", flush=True)
+        oom_before = oom_kill_count()
+        seen = {"oom": False, "enospc": False, "pass": False, "log_full": False}
+        last_states: list[int] = []
+        started = time.monotonic()
+        try:
+            self.proc = subprocess.Popen(
+                self.command(model, states), cwd=states, env=env,
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT, start_new_session=True)
+        except OSError as e:
+            logf.close()
+            model.status, model.detail = EXIT_FAIL, f"cannot start java: {e.strerror}"
+            say(f"FAIL {model.label}: {model.detail}")
+            return
+
+        def pump() -> None:
+            assert self.proc and self.proc.stdout
+            for raw in iter(self.proc.stdout.readline, b""):
+                line = raw.decode("utf-8", errors="replace")
+                sys.stdout.write(line)
+                sys.stdout.flush()
+                if not seen["log_full"]:
+                    try:
+                        logf.write(raw)
+                        logf.flush()
+                    except OSError as e:
+                        if e.errno in (errno.ENOSPC, errno.EDQUOT):
+                            seen["log_full"] = True
+                        else:
+                            raise
+                if any(m in line for m in OOM_MARKERS):
+                    seen["oom"] = True
+                if any(m in line for m in ENOSPC_MARKERS) and not seen["enospc"]:
+                    seen["enospc"] = time.monotonic()
+                if PASS_LINE in line:
+                    seen["pass"] = True
+                m = STATES_RE.search(line)
+                if m:
+                    last_states.append(int(m.group(1).replace(",", "")))
+
+        reader = threading.Thread(target=pump, daemon=True)
+        reader.start()
+        timed_out = False
+        while True:
+            try:
+                self.proc.wait(timeout=0.5)
+                break
+            except subprocess.TimeoutExpired:
+                pass
+            if self.interrupted is not None or seen["log_full"]:
+                self.stop()
+                break
+            # TLC normally exits after a write error; a JVM that does not is
+            # stopped, so that a full scratch directory is not reported as a
+            # deadline.
+            if seen["enospc"] and time.monotonic() - seen["enospc"] >= ENOSPC_GRACE:
+                self.stop()
+                break
+            if time.monotonic() - started >= self.deadline:
+                timed_out = True
+                self.stop()
+                break
+        reader.join(timeout=TERM_GRACE)
+        rc = self.proc.wait()
+        self.proc = None
+        try:
+            logf.close()
+        except OSError as e:
+            if e.errno in (errno.ENOSPC, errno.EDQUOT):
+                seen["log_full"] = True
+        # States are only needed while TLC runs; free the scratch space for
+        # the next model. The log keeps the result and any counterexample.
+        shutil.rmtree(states, ignore_errors=True)
+        oom_killed = oom_kill_count() > oom_before
+        elapsed = time.monotonic() - started
+        count = last_states[-1] if last_states else None
+
+        if self.interrupted is not None:
+            model.status, model.detail = EXIT_FAIL, f"stopped by signal {self.interrupted}"
+        elif timed_out:
+            model.status = EXIT_DEADLINE
+            model.detail = f"deadline {fmt_duration(self.deadline)} reached; the JVM was stopped"
+        elif seen["log_full"] or seen["enospc"]:
+            model.status = EXIT_SCRATCH_FULL
+            model.detail = (f"scratch directory {self.out} is full "
+                            f"({'tmpfs' if self.scratch_tmpfs else 'disk'}); use a larger "
+                            "scratch directory or a disk-backed --out")
+        elif seen["oom"] or oom_killed:
+            model.status = EXIT_OOM
+            how = "the kernel OOM killer stopped the JVM" if oom_killed and not seen["oom"] \
+                else "Java heap exhausted"
+            model.detail = (f"out of memory: {how} (heap {fmt_size(self.heap)}, "
+                            f"off-heap {fmt_size(self.offheap)}); raise --memory and the "
+                            "container limit, or shrink the model")
+        elif rc != 0 or not seen["pass"]:
+            model.status = EXIT_FAIL
+            if rc < 0:
+                why = f"the JVM was killed by signal {-rc}"
+            elif rc != 0:
+                why = f"TLC exited {rc}"
+            else:
+                why = "TLC did not report a completed check"
+            model.detail = f"{why}; log: {log}"
+        elif expected is not None and count is None:
+            model.status = EXIT_FAIL
+            model.detail = f"expected-states is {expected} but TLC printed no distinct-state count"
+        elif expected is not None and count > 10 * expected:
+            model.status = EXIT_FAIL
+            model.detail = (f"{count} distinct states > {10 * expected} "
+                            f"(10 x expected-states {expected})")
+        else:
+            model.status = EXIT_PASS
+            if expected is None:
+                model.detail = f"{count if count is not None else 'unknown'} distinct states (no expected-states guard)"
+            else:
+                model.detail = (f"{count} distinct states <= {10 * expected} "
+                                f"(10 x expected-states {expected})")
+        verdict = "PASS" if model.status == EXIT_PASS else "FAIL"
+        say(f"{verdict} {model.label} in {elapsed:.0f}s: {model.detail}")
+
+
+# --------------------------------------------------------------------------
+# Version
+
+
+def jar_path() -> Path:
+    return Path(os.environ.get(JAR_ENV) or DEFAULT_JAR)
+
+
+def tlc_version(jar: Path) -> str:
+    try:
+        with zipfile.ZipFile(jar) as z:
+            manifest = z.read("META-INF/MANIFEST.MF").decode("utf-8", errors="replace")
+    except (OSError, KeyError, zipfile.BadZipFile) as e:
+        return f"unknown ({jar}: {e})"
+    fields = {}
+    for line in manifest.splitlines():
+        k, sep, v = line.partition(":")
+        if sep:
+            fields[k.strip()] = v.strip()
+    tag = fields.get("X-Git-Tag", "unknown")
+    rev = fields.get("X-Git-ShortRevision", "unknown")
+    return f"{tag} (revision {rev})"
+
+
+def jar_sha256(jar: Path) -> str:
+    h = hashlib.sha256()
+    try:
+        with open(jar, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+    except OSError as e:
+        return f"unknown ({e.strerror})"
+    return h.hexdigest()
+
+
+def jre_version(java: str | None) -> str:
+    home = os.environ.get("JAVA_HOME")
+    if home:
+        try:
+            fields = {}
+            for line in Path(home, "release").read_text().splitlines():
+                k, sep, v = line.partition("=")
+                if sep:
+                    fields[k] = v.strip().strip('"')
+            if "JAVA_RUNTIME_VERSION" in fields or "JAVA_VERSION" in fields:
+                ver = fields.get("JAVA_RUNTIME_VERSION") or fields["JAVA_VERSION"]
+                return f"{ver} ({fields.get('IMPLEMENTOR', 'unknown vendor')})"
+        except OSError:
+            pass
+    if not java:
+        return "unknown (java not found)"
+    env = {k: v for k, v in os.environ.items() if k not in JAVA_ENV_OPTIONS}
+    try:
+        r = subprocess.run([java, "-Xmx32m", "-XX:-UsePerfData", "-XshowSettings:properties",
+                            "-version"], env=env, capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return f"unknown ({e})"
+    props = {}
+    for line in r.stderr.splitlines():
+        k, sep, v = line.strip().partition(" = ")
+        if sep:
+            props[k] = v
+    return f"{props.get('java.runtime.version', 'unknown')} ({props.get('java.vendor', 'unknown vendor')})"
+
+
+def print_version() -> None:
+    jar = jar_path()
+    print(f"tlc-check {VERSION}")
+    print(f"TLC {tlc_version(jar)}, tla2tools.jar sha256 {jar_sha256(jar)}")
+    print(f"JRE {jre_version(shutil.which('java'))}")
+
+
+# --------------------------------------------------------------------------
+# Main
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog=PROG,
+        description="Model-check every <Name>.cfg in DIR against <Name>.tla with TLC.",
+        epilog=("Exit status: 0 every model passed; 1 a model failed; 2 usage error; "
+                "3 out of memory; 4 scratch directory full; 124 deadline reached. "
+                "Contract: docs/SPECS.md."))
+    p.add_argument("dir", nargs="?", default="specs", metavar="DIR",
+                   help="spec directory (default: specs)")
+    p.add_argument("--deep", action="store_true",
+                   help="check the deep models <Name>.deep.cfg instead of the default models")
+    p.add_argument("--memory", type=parse_size, metavar="SIZE",
+                   help="JVM budget B (heap plus off-heap), for example 1g; "
+                        "default: container limit minus scratch minus headroom")
+    p.add_argument("--workers", type=parse_workers, metavar="N",
+                   help="TLC worker threads (default: the CPUs available to the container)")
+    p.add_argument("--deadline", type=parse_duration, metavar="DURATION",
+                   default=DEFAULT_DEADLINE,
+                   help=f"deadline per model, for example 90m (default: {fmt_duration(DEFAULT_DEADLINE)})")
+    p.add_argument("--out", metavar="DIR",
+                   help="scratch directory for states, logs and traces "
+                        "(default: a new directory under /tmp)")
+    p.add_argument("--version", action="store_true",
+                   help="print the tlc-check, TLC and JRE versions and exit")
+    return p
+
+
+def plan_memory(requested: int | None, out: Path) -> tuple[int, Mount | None, int]:
+    """Return (B, scratch mount, S). Raise UsageError on a policy violation."""
+    limit = memory_limit()
+    mnt = mount_of(out)
+    tmpfs = mnt is not None and mnt.fstype == "tmpfs"
+    sized = tmpfs and any(o.startswith("size=") or o.startswith("nr_blocks=") for o in mnt.options)
+    scratch = 0
+    if tmpfs:
+        st = os.statvfs(out)
+        scratch = st.f_blocks * st.f_frsize
+
+    if limit is None:
+        warn("the container has no memory limit, so nothing protects the host; "
+             "run it with --memory and an equal --memory-swap")
+        budget = requested if requested is not None else NO_LIMIT_BUDGET
+        if budget < MIN_BUDGET:
+            raise UsageError(f"--memory {fmt_size(budget)} is below the minimum budget "
+                             f"{fmt_size(MIN_BUDGET)}")
+        return budget, mnt, scratch
+
+    if tmpfs and not sized:
+        raise UsageError(
+            f"the scratch directory {out} is on a tmpfs without a size limit "
+            f"({mnt.point}), inside a container limited to {fmt_size(limit)}; "
+            f"give the tmpfs a size, for example --tmpfs {mnt.point}:size=256m,mode=1777, "
+            "or pass --out with a disk-backed directory")
+    available = limit - scratch - HEADROOM
+    if requested is not None:
+        if requested > available:
+            raise UsageError(
+                f"--memory {fmt_size(requested)} does not fit: B + scratch + headroom = "
+                f"{fmt_size(requested)} + {fmt_size(scratch)} + {fmt_size(HEADROOM)} > "
+                f"container limit {fmt_size(limit)}; the largest budget here is "
+                f"{fmt_size(max(available, 0))}")
+        budget = requested
+    else:
+        budget = available
+    if budget < MIN_BUDGET:
+        raise UsageError(
+            f"the JVM budget {fmt_size(max(budget, 0))} is below the minimum "
+            f"{fmt_size(MIN_BUDGET)} (container limit {fmt_size(limit)}, scratch "
+            f"{fmt_size(scratch)}, headroom {fmt_size(HEADROOM)}); raise the container "
+            "limit or use a smaller tmpfs or a disk-backed --out")
+    return budget, mnt, scratch
+
+
+def main(argv: list[str]) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)        # exits 2 on a usage error
+    if args.version:
+        print_version()
+        return EXIT_PASS
+
+    created: Path | None = None
+    try:
+        spec_dir = Path(args.dir).resolve()
+        models = discover(spec_dir, args.deep)
+
+        jar = jar_path()
+        if not jar.is_file():
+            raise UsageError(f"tla2tools.jar not found at {jar} (set {JAR_ENV})")
+        java = shutil.which("java")
+        if not java:
+            raise UsageError("java not found on PATH")
+
+        if args.out:
+            out = Path(args.out).resolve()
+        else:
+            out = None
+        if out is not None:
+            if out == spec_dir or spec_dir in out.parents:
+                raise UsageError(f"--out {out} is inside the spec directory; "
+                                 "tlc-check never writes into the spec directory")
+            try:
+                out.mkdir(parents=True, exist_ok=True)
+            except OSError as e:
+                raise UsageError(f"cannot create --out {out}: {e.strerror}")
+            if not os.access(out, os.W_OK | os.X_OK):
+                raise UsageError(f"--out {out} is not writable")
+        else:
+            try:
+                out = created = Path(tempfile.mkdtemp(prefix="tlc-check-", dir="/tmp"))
+            except OSError as e:
+                raise UsageError(f"cannot create a scratch directory under /tmp: {e.strerror}; "
+                                 "mount a writable /tmp or pass --out")
+            if out == spec_dir or spec_dir in out.parents:
+                raise UsageError("the default scratch directory /tmp is inside the spec "
+                                 "directory; pass --out")
+
+        check_overlap(models, spec_dir, out)
+        budget, mnt, scratch = plan_memory(args.memory, out)
+    except UsageError as e:
+        if created is not None:
+            shutil.rmtree(created, ignore_errors=True)
+        print(f"{PROG}: error: {e}", file=sys.stderr, flush=True)
+        return EXIT_USAGE
+
+    heap = budget * HEAP_PERCENT // 100
+    offheap = budget * OFFHEAP_PERCENT // 100
+    workers = args.workers or available_cpus()
+    limit = memory_limit()
+    say(f"{len(models)} model(s) in {spec_dir}{' (deep)' if args.deep else ''}")
+    say(f"memory: container limit {fmt_size(limit) if limit else 'none'}, scratch "
+        f"{out} ({mnt.fstype if mnt else 'unknown'}, counted {fmt_size(scratch)}), headroom "
+        f"{fmt_size(HEADROOM)}, budget {fmt_size(budget)} = heap {fmt_size(heap)} + "
+        f"off-heap {fmt_size(offheap)} + GC reserve")
+    say(f"workers {workers}, deadline {fmt_duration(args.deadline)} per model")
+
+    runner = Runner(jar, java, heap, offheap, workers, args.deadline, out,
+                    scratch_tmpfs=bool(mnt and mnt.fstype == "tmpfs"))
+
+    def on_signal(signum, _frame):
+        runner.interrupted = signum
+
+    for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(s, on_signal)
+
+    for model in models:
+        if runner.interrupted is not None:
+            break
+        runner.run(model)
+
+    say("summary:")
+    for model in models:
+        if runner.interrupted is not None and model.detail == "":
+            print(f"  {model.label}: not run (interrupted)", flush=True)
+            continue
+        print(f"  {model.label}: status {model.status}: {model.detail}", flush=True)
+    if runner.interrupted is not None:
+        say(f"interrupted by signal {runner.interrupted}")
+        return 128 + runner.interrupted
+    statuses = {m.status for m in models}
+    for status in EXIT_PRECEDENCE:
+        if status in statuses:
+            return status
+    return EXIT_PASS
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

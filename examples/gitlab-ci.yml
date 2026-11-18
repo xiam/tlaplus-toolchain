@@ -1,0 +1,34 @@
+# Example only: a GitLab CI job that model-checks the specs in specs/ with
+# the hardened invocation. Copy it into .gitlab-ci.yml and adapt it; it is an
+# illustration, not a maintained template.
+# Guide: docs/INTEGRATION.md in the tlaplus-toolchain repository.
+#
+# The job needs a Docker daemon: a runner with a `docker:dind` service, or a
+# runner that gives jobs a Docker socket. The daemon may not see the job's
+# files, so the specs reach the container through a Docker volume instead of
+# a bind mount. The volume is mounted read-only, as the spec directory must be.
+
+tlc-check:
+  image: docker:29.1.3-cli
+  variables:
+    # Pin by digest: append @sha256:<digest> from the release notes.
+    TLAPLUS_IMAGE: ghcr.io/xiam/tlaplus-toolchain:0.1.0
+    SPEC_DIR: specs
+    SPEC_VOLUME: tlc-specs-$CI_JOB_ID
+    SPEC_LOADER: tlc-loader-$CI_JOB_ID
+  script:
+    - docker volume create "$SPEC_VOLUME"
+    - docker create --name "$SPEC_LOADER" --network none -v "$SPEC_VOLUME:/specs" "$TLAPLUS_IMAGE" true
+    - docker cp "$SPEC_DIR/." "$SPEC_LOADER:/specs"
+    - docker rm "$SPEC_LOADER"
+    - >-
+      docker run --rm
+      --network none --read-only --tmpfs /tmp:size=256m,mode=1777
+      --cap-drop ALL --security-opt no-new-privileges
+      --user 10001:10001
+      --memory 2g --memory-swap 2g --cpus 2 --pids-limit 512
+      -v "$SPEC_VOLUME:/specs:ro"
+      "$TLAPLUS_IMAGE" tlc-check /specs
+  after_script:
+    - docker rm -f "tlc-loader-$CI_JOB_ID" || true
+    - docker volume rm -f "tlc-specs-$CI_JOB_ID"

@@ -1,0 +1,78 @@
+# Verifies a published release as a consumer sees it, with no registry login:
+#   - the image ghcr.io/<owner>/<repo>:X.Y.Z pulls anonymously;
+#   - its index lists exactly linux/amd64 and linux/arm64;
+#   - its digest equals the digest in the release notes;
+#   - the hardened invocation of docs/SPECS.md returns 0 on examples/specs;
+#   - the GitHub Actions example of docs/INTEGRATION.md runs unchanged
+#     (only SPEC_DIR points at examples/specs).
+# Run it by hand after the package is public (docs/RELEASE.md).
+name: verify
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to verify (vX.Y.Z)
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      TAG: ${{ inputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+          persist-credentials: false
+      - name: Resolve the image and the digest from the release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(python3 scripts/release.py version "$TAG")
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          notes_digest=$(gh release view "$TAG" --json body --jq .body | grep -oE -m1 'sha256:[0-9a-f]{64}')
+          {
+            echo "IMAGE=$image"
+            echo "VERSION=$version"
+            echo "NOTES_DIGEST=$notes_digest"
+          } >> "$GITHUB_ENV"
+          echo "release notes digest: $notes_digest"
+      - name: Pull anonymously and compare the digest
+        run: |
+          docker logout ghcr.io >/dev/null 2>&1 || true
+          registry_digest=$(python3 scripts/release.py assert-platforms "$IMAGE" "$VERSION" linux/amd64 linux/arm64)
+          docker pull "$IMAGE:$VERSION"
+          pulled=$(docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$IMAGE:$VERSION" | grep -oE 'sha256:[0-9a-f]{64}' | head -1)
+          echo "registry: $registry_digest"
+          echo "pulled:   $pulled"
+          echo "notes:    $NOTES_DIGEST"
+          test "$registry_digest" = "$NOTES_DIGEST"
+          test "$pulled" = "$NOTES_DIGEST"
+      - name: Hardened invocation (docs/SPECS.md) on examples/specs
+        run: |
+          docker run --rm \
+            --network none --read-only --tmpfs /tmp:size=256m,mode=1777 \
+            --cap-drop ALL --security-opt no-new-privileges \
+            --user "$(id -u):$(id -g)" \
+            --memory 2g --memory-swap 2g --cpus 2 --pids-limit 512 \
+            -v "$PWD/examples/specs:/specs:ro" \
+            "$IMAGE:$VERSION" tlc-check /specs
+      - name: The GitHub Actions example of the guide, unchanged
+        run: |
+          python3 - <<'EOF' > "$RUNNER_TEMP/example.sh"
+          import shlex, yaml
+          job = yaml.safe_load(open("examples/github-actions.yml"))["jobs"]["tlc-check"]
+          env = dict(job["env"], SPEC_DIR="examples/specs")
+          step = next(s for s in job["steps"] if s.get("name") == "Model-check the specs")
+          print("set -eu")
+          for k, v in env.items():
+              print(f"export {k}={shlex.quote(str(v))}")
+          print(step["run"])
+          EOF
+          cat "$RUNNER_TEMP/example.sh"
+          bash "$RUNNER_TEMP/example.sh"
