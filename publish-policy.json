@@ -1,0 +1,12 @@
+{
+  "blocked_paths": [
+    ".gitattributes",
+    "docs/internal/**",
+    "scripts/public-tree.rules"
+  ],
+  "published_branches": [
+    "main"
+  ],
+  "schema_version": 2,
+  "source_hash": "sha256:e07b0ef11881e30395c9dcbd4757587636d84d081ece1c487627ebc26ad94b53"
+}
